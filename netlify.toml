@@ -1,0 +1,93 @@
+# Netlify deploy for the personal site + G1 Motion Lab.
+#
+# The lab uses single-threaded MuJoCo + ONNX Runtime WASM (no SharedArrayBuffer),
+# so COOP/COEP headers are intentionally NOT set — plain CDN hosting works.
+#
+# Build uses Vite base `/` (default). Do not set GITHUB_ACTIONS here.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+  # Root site on Netlify — never a GitHub Pages project subpath.
+  VITE_BASE = "/"
+
+# Pretty lab URL
+[[redirects]]
+  from = "/lab"
+  to = "/lab.html"
+  status = 200
+
+# SPA-ish: keep multi-page; unknown paths → home (optional soft 404)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 404
+
+# ---- MIME + cache for heavy lab assets ------------------------------------
+# Hashed Vite chunks / wasm in /assets — immutable forever
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/assets/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ORT runtime copied to /ort/ (path is stable across builds)
+[[headers]]
+  for = "/ort/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/ort/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+# Policy + motion bins — large; cache a week (content changes rarely)
+[[headers]]
+  for = "/policies/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/policies/*.onnx"
+  [headers.values]
+    Content-Type = "application/octet-stream"
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/policies/*.bin"
+  [headers.values]
+    Content-Type = "application/octet-stream"
+    Cache-Control = "public, max-age=604800"
+
+# Robot meshes / MJCF (~36MB) — long cache
+[[headers]]
+  for = "/robots/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+# HTML: always revalidate so lab.html / index pick up new asset hashes
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"

@@ -1,0 +1,253 @@
+/**
+ * Geom renderer — Three.js meshes driven straight from the compiled MuJoCo model.
+ *
+ * Builds one mesh per visual geom from the model's geom types — primitives
+ * (sphere/capsule/cylinder/box/plane) plus actual mesh buffers
+ * (`model.mesh_vert` / `model.mesh_face`) for `mjGEOM_MESH`. Each frame it reads
+ * `data.geom_xpos` / `data.geom_xmat` (per-geom world transform) and updates the
+ * matrices. (Same approach as zalo/mujoco_wasm's Three.js demo.) The engine uses
+ * this rather than a baked GLB — it's crisper and needs no separate mesh asset.
+ *
+ * Materials follow mjswan's MuJoCo → MeshPhysicalMaterial mapping: dielectric
+ * defaults with specular scaled by the scene's specular/diffuse light ratio.
+ * Silver vs black parts get different roughness; specular is cool-tinted to
+ * sit in the branded teal viewport.
+ */
+
+import {
+  BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
+  CapsuleGeometry,
+  Color,
+  CylinderGeometry,
+  Group,
+  Matrix4,
+  Mesh,
+  MeshPhysicalMaterial,
+  Object3D,
+  PlaneGeometry,
+  Quaternion,
+  SphereGeometry,
+  SRGBColorSpace,
+  Vector3,
+} from 'three';
+import type { MujocoSim } from './mujoco';
+
+// MuJoCo geom type ids (mjtGeom).
+const PLANE = 0;
+const SPHERE = 2;
+const CAPSULE = 3;
+const ELLIPSOID = 4;
+const CYLINDER = 5;
+const BOX = 6;
+const MESH = 7;
+
+/**
+ * Scene specular/diffuse peak ratio for G1 MJCF lighting
+ * (directional defaults 0.3/0.7 + headlight 0.9/0.6), matching mjswan
+ * `lightSpecularRatio`. Applied to material `specularIntensity`.
+ */
+const LIGHT_SPECULAR_RATIO = (0.3 + 0.9) / (0.7 + 0.6);
+
+/** MuJoCo material defaults when MJCF sets only rgba (Menagerie / G1). */
+const MJ_MAT_SPECULAR = 0.5;
+
+const Z_UP_TO_Y_UP = new Quaternion().setFromAxisAngle(
+  new Vector3(1, 0, 0),
+  -Math.PI / 2,
+);
+
+export interface GeomBinding {
+  readonly root: Group;
+  sync(sim: MujocoSim): void;
+  readonly geomCount: number;
+  /** The built meshes (visual geoms), each tagged `userData.bodyId`, for raycast picking. */
+  readonly pickMeshes: Mesh[];
+}
+
+/**
+ * Build a Three.js mesh per visible geom. Renders only the VISUAL geoms
+ * (group 1/2 — the pretty meshes); collision primitives are skipped. The wrapper
+ * group carries the single Z-up→Y-up conversion. Each mesh records its MuJoCo
+ * `body id` in `userData.bodyId` so the drag interaction can pick a body.
+ */
+export function buildGeomRenderer(opts: {
+  sim: MujocoSim;
+  parent: Object3D;
+  /** Geom groups to include (MuJoCo `geom_group`). Visual meshes are 1 or 2. */
+  includeGroups?: Set<number>;
+}): GeomBinding {
+  const { sim } = opts;
+  const m = sim.model;
+  const ngeom = m.ngeom as number;
+  // Live typed-array views, declared `any` in the bindings; read via `any`
+  // locals so element access is `any` (indices are provably in range).
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const geomType: any = m.geom_type;
+  const geomSize: any = m.geom_size; // [ngeom*3]
+  const geomRgba: any = m.geom_rgba; // [ngeom*4]
+  const geomGroup: any = m.geom_group;
+  const geomDataId: any = m.geom_dataid; // mesh id, or -1
+  const geomBodyId: any = m.geom_bodyid; // owning body id per geom
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+  const include = opts.includeGroups ?? new Set([1, 2]);
+
+  const root = new Group();
+  root.name = 'g1-geom-bound';
+  root.quaternion.copy(Z_UP_TO_Y_UP);
+
+  // Per-geom Three.js mesh, indexed by geom id (null for skipped geoms).
+  const meshes: Array<Mesh | null> = new Array(ngeom).fill(null);
+  const pickMeshes: Mesh[] = [];
+  let geomCount = 0;
+
+  for (let g = 0; g < ngeom; g++) {
+    if (!include.has(geomGroup[g])) continue;
+    const geometry = makeGeometry(
+      geomType[g],
+      geomSize.subarray(g * 3, g * 3 + 3),
+      geomDataId[g],
+      sim,
+    );
+    if (!geometry) continue;
+    const r = g * 4;
+    // MJCF rgba is authored as display/sRGB (black≈0.2). With sRGB framebuffer
+    // output we must convert into linear working space, or darks lift to grey.
+    const color = new Color().setRGB(
+      geomRgba[r],
+      geomRgba[r + 1],
+      geomRgba[r + 2],
+      SRGBColorSpace,
+    );
+    // Silver (bright) a bit glossier; black parts more matte — reads with the floor.
+    const luma = 0.2126 * geomRgba[r] + 0.7152 * geomRgba[r + 1] + 0.0722 * geomRgba[r + 2];
+    const shininess = luma > 0.35 ? 0.68 : 0.48;
+    const material = new MeshPhysicalMaterial({
+      color,
+      roughness: 1 - shininess,
+      metalness: 0,
+      specularIntensity: MJ_MAT_SPECULAR * LIGHT_SPECULAR_RATIO,
+      // Cool specular so highlights echo the teal viewport, not studio white.
+      specularColor: new Color(0xd4e4f0),
+    });
+    const mesh = new Mesh(geometry, material);
+    // Match mjswan: meshes cast; only non-mesh geoms receive (avoids muddy self-shadow).
+    mesh.castShadow = true;
+    mesh.receiveShadow = geomType[g] !== MESH;
+    mesh.matrixAutoUpdate = false; // we set the matrix directly each frame
+    mesh.userData.bodyId = geomBodyId[g] as number;
+    meshes[g] = mesh;
+    pickMeshes.push(mesh);
+    root.add(mesh);
+    geomCount += 1;
+  }
+
+  opts.parent.add(root);
+
+  const tmpMat = new Matrix4();
+
+  function sync(s: MujocoSim): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gxpos: any = s.data.geom_xpos; // [ngeom*3]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gxmat: any = s.data.geom_xmat; // [ngeom*9] row-major
+    for (let g = 0; g < ngeom; g++) {
+      const mesh = meshes[g];
+      if (!mesh) continue;
+      const p = g * 3;
+      const r = g * 9;
+      // Compose a world matrix from MuJoCo rotation (row-major 3x3) + position.
+      // three.js Matrix4.set takes row-major args, so this maps cleanly.
+      tmpMat.set(
+        gxmat[r + 0], gxmat[r + 1], gxmat[r + 2], gxpos[p + 0],
+        gxmat[r + 3], gxmat[r + 4], gxmat[r + 5], gxpos[p + 1],
+        gxmat[r + 6], gxmat[r + 7], gxmat[r + 8], gxpos[p + 2],
+        0, 0, 0, 1,
+      );
+      mesh.matrix.copy(tmpMat);
+    }
+  }
+
+  return { root, sync, geomCount, pickMeshes };
+}
+
+/**
+ * Build the Three.js geometry for one MuJoCo geom. MuJoCo geom sizes are
+ * half-extents; primitives are axis-aligned in MuJoCo's convention (cylinders/
+ * capsules along local Z), so we rotate the cap geometries +90° about X to match
+ * three.js' Y-axis convention.
+ */
+function makeGeometry(
+  type: number,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  size: any, // length-3 view of geom half-extents
+  dataId: number,
+  sim: MujocoSim,
+): BufferGeometry | null {
+  switch (type) {
+    case PLANE:
+      // size[0],size[1] are half-extents; 0 means "infinite" → use a large quad.
+      return new PlaneGeometry(
+        (size[0] || 10) * 2,
+        (size[1] || 10) * 2,
+      ).rotateX(-Math.PI / 2);
+    case SPHERE:
+      return new SphereGeometry(size[0], 24, 16);
+    case CAPSULE: {
+      // MuJoCo capsule: radius=size[0], half-length(of cylinder part)=size[1],
+      // axis along local Z. three.js capsule axis is Y.
+      const geo = new CapsuleGeometry(size[0], size[1] * 2, 8, 16);
+      geo.rotateX(Math.PI / 2);
+      return geo;
+    }
+    case CYLINDER: {
+      const geo = new CylinderGeometry(size[0], size[0], size[1] * 2, 24);
+      geo.rotateX(Math.PI / 2);
+      return geo;
+    }
+    case ELLIPSOID: {
+      const geo = new SphereGeometry(1, 24, 16);
+      geo.scale(size[0], size[1], size[2]);
+      return geo;
+    }
+    case BOX:
+      return new BoxGeometry(size[0] * 2, size[1] * 2, size[2] * 2);
+    case MESH:
+      return dataId >= 0 ? makeMeshGeometry(dataId, sim) : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Build a BufferGeometry from MuJoCo's compiled mesh buffers for mesh `dataId`.
+ * `mesh_vert` is a flat [nvert*3] float array; `mesh_face` is [nface*3] ints.
+ */
+function makeMeshGeometry(dataId: number, sim: MujocoSim): BufferGeometry {
+  const m = sim.model;
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const vertAdr: number = (m.mesh_vertadr as any)[dataId];
+  const vertNum: number = (m.mesh_vertnum as any)[dataId];
+  const faceAdr: number = (m.mesh_faceadr as any)[dataId];
+  const faceNum: number = (m.mesh_facenum as any)[dataId];
+  const allVerts: any = m.mesh_vert;
+  const allFaces: any = m.mesh_face;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  const positions = new Float32Array(vertNum * 3);
+  positions.set(allVerts.subarray(vertAdr * 3, (vertAdr + vertNum) * 3));
+
+  const indices = new Uint32Array(faceNum * 3);
+  // MuJoCo `mesh_face` indices are MESH-LOCAL (in [0, vertnum)), so they map
+  // straight onto our per-mesh `positions` slice — do NOT subtract vertAdr.
+  for (let i = 0; i < faceNum * 3; i++) {
+    indices[i] = allFaces[faceAdr * 3 + i];
+  }
+
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new BufferAttribute(positions, 3));
+  geo.setIndex(new BufferAttribute(indices, 1));
+  geo.computeVertexNormals();
+  return geo;
+}

@@ -1,0 +1,95 @@
+/* =============================================================================
+ * Design tokens — obsidian studio + champagne tech accent.
+ * Quiet chrome; gold reserved for selection, CTAs, and live signals.
+ * ============================================================================= */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #08090b;
+  --surface: #101214;
+  --surface-raised: #181b1f;
+  --surface-hover: #1f2429;
+  --text: #f3f0ea;
+  --muted: #9a958c;
+  --accent: #c6b089;
+  --accent-strong: #e2d2b0;
+  --border: #2a2d31;
+  --border-subtle: #1c1f23;
+  --ok: #7f9e8c;
+  --warn: #d0b07a;
+  --danger: #c48484;
+
+  /* Legacy aliases (viewer + existing components) */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-strong);
+  --color-amber: var(--warn);
+  --color-success: var(--ok);
+  --color-danger: var(--danger);
+
+  /* Viewport — deep studio floor */
+  --color-viewport-bg: #0b0c0e;
+  --color-floor: #15181c;
+  --color-grid-major: #3a3d42;
+  --color-grid-minor: #23262b;
+
+  /* Atmosphere */
+  --glow-accent: color-mix(in srgb, var(--accent) 14%, transparent);
+  --glow-deep: color-mix(in srgb, #1a1610 55%, transparent);
+
+  --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --font-display: var(--font-sans);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --duration: 150ms;
+
+  --rail-w: 220px;
+  --tele-w: 200px;
+  --top-h: 48px;
+  --dock-h: 56px;
+
+  --content-max: 1100px;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f3f1ec;
+  --surface: #fffcf7;
+  --surface-raised: #efeae2;
+  --surface-hover: #e6e0d6;
+  --text: #161410;
+  --muted: #6d675c;
+  --accent: #8a7349;
+  --accent-strong: #6e5a36;
+  --border: #d4cec3;
+  --border-subtle: #e6e1d8;
+  --ok: #3f6b55;
+  --warn: #8a6a2f;
+  --danger: #9a4d4d;
+
+  --color-viewport-bg: #ddd8cf;
+  --color-floor: #c9c3b8;
+  --color-grid-major: #8f887c;
+  --color-grid-minor: #b5aea2;
+
+  --glow-accent: color-mix(in srgb, var(--accent) 10%, transparent);
+  --glow-deep: color-mix(in srgb, #d8d0c4 40%, transparent);
+}

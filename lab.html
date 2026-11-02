@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0D0F11" />
+    <title>G1 · Motion Lab</title>
+    <meta
+      name="description"
+      content="Full Unitree G1 closed-loop motion laboratory — MuJoCo WASM physics and one pretrained ONNX policy."
+    />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/style.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css"
+    />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('wbc-demo-theme');
+          document.documentElement.dataset.theme =
+            t === 'light' || t === 'dark' ? t : 'dark';
+          document.documentElement.style.colorScheme =
+            document.documentElement.dataset.theme;
+        } catch (e) {
+          document.documentElement.dataset.theme = 'dark';
+          document.documentElement.style.colorScheme = 'dark';
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <main class="page" id="app"></main>
+    <script type="module" src="/src/tracking-page.ts"></script>
+  </body>
+</html>

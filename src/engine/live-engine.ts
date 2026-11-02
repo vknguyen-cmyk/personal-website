@@ -1,0 +1,1250 @@
+/**
+ * Live WBC engine — reusable, DOM-free.
+ *
+ * Mounts a mujoco-wasm physics sim + onnxruntime-web policy + the deploy
+ * obs/action/PD pipeline into a Three.js viewport and exposes an imperative
+ * control surface (play/pause, clip switch, speed, policy/open-loop, perturb,
+ * camera). Both the per-policy page and the gallery's live cards drive it; the
+ * UI chrome lives in the page, not here.
+ *
+ * Distilled from the original tracer-bullet spike (since removed); the loop
+ * math + training-parity timing rationale live inline below.
+ */
+
+import {
+  Box3,
+  BufferGeometry,
+  Line,
+  LineBasicMaterial,
+  Raycaster,
+  Vector2,
+  Vector3,
+} from 'three';
+import { Viewer } from '../viewer/renderer';
+import { loadG1Sim, type MujocoSim } from './mujoco';
+import { buildGeomRenderer, type GeomBinding } from './geom-renderer';
+import {
+  loadPolicyConfig,
+  loadReferenceIndex,
+  loadReferenceStream,
+  type PolicyConfig,
+  type ReferenceClip,
+  type ReferenceIndex,
+  type ReferenceStream,
+} from './policy-config';
+import {
+  browsableClipsWithoutManifest,
+  defaultBrowsableClip,
+  loadClipManifest,
+  resolveBrowsableClips,
+  resolvePoseClip,
+  type ClipManifest,
+} from './clip-manifest';
+import {
+  browseNext,
+  browsePrev,
+  canBrowseClips,
+  canGetup,
+  canLiedown,
+  canPlaySelectedClip,
+  createWbcFsm,
+  enterClipSelectMode,
+  fsmUiLabel,
+  onClipFinished,
+  startBrowsablePlayback,
+  startPosePlayback,
+  type ClipKind,
+  type WbcFsmState,
+} from './wbc-fsm';
+import { loadPolicy, type PolicyRunner } from './policy-runner';
+import { makeWbcController, type WbcController } from './wbc-controller';
+import {
+  createGenReferenceEngine,
+  type GenReferenceEngine,
+} from './gen-reference-engine';
+import { makeGenProprioReader, type GenProprioReader } from './gen-proprio';
+import { clamp, playRange } from './gen-params';
+import { applyIdleDeadzone } from './gen-waypoints';
+import { preferLowQualityGl, whenElementSized } from '../platform';
+
+// Physics: use scene_g1.xml as-is (unitree_rl_mjlab/simulate deploy sim; MuJoCo default
+// timestep 0.002 s, no injected <option>). Policy still runs at policy_step_dt (50 Hz).
+/** Stick/key cruise × gait vel_mult, then clamped to gen play_vel_ranges. */
+const CRUISE_VX: [number, number] = [-0.8, 0.9];
+const CRUISE_VY: [number, number] = [-1.0, 1.0];
+const CRUISE_WZ: [number, number] = [-2.0, 2.0];
+/** Match wbc_g1_deploy config.yaml reference_node gait heights + vel_mult. */
+const STAND_HEIGHT = 0.81;
+const SPRINT_HEIGHT = 0.75;
+const CROUCH_HEIGHT = 0.55;
+const WALK_VEL_MULT = 1.0;
+const SPRINT_VEL_MULT = 4.5;
+const CROUCH_VEL_MULT = 0.9;
+const SCENE_XML = 'scene_g1.xml';
+
+// The 34 STL basenames referenced by scene_g1.xml.
+const MESH_FILES = [
+  'pelvis.STL', 'pelvis_contour_link.STL',
+  'left_hip_pitch_link.STL', 'left_hip_roll_link.STL', 'left_hip_yaw_link.STL',
+  'left_knee_link.STL', 'left_ankle_pitch_link.STL', 'left_ankle_roll_link.STL',
+  'right_hip_pitch_link.STL', 'right_hip_roll_link.STL', 'right_hip_yaw_link.STL',
+  'right_knee_link.STL', 'right_ankle_pitch_link.STL', 'right_ankle_roll_link.STL',
+  'waist_yaw_link_rev_1_0.STL', 'waist_roll_link_rev_1_0.STL', 'torso_link_rev_1_0.STL',
+  'logo_link.STL', 'head_link.STL',
+  'left_shoulder_pitch_link.STL', 'left_shoulder_roll_link.STL', 'left_shoulder_yaw_link.STL',
+  'left_elbow_link.STL', 'left_wrist_roll_link.STL', 'left_wrist_pitch_link.STL',
+  'left_wrist_yaw_link.STL', 'left_rubber_hand.STL',
+  'right_shoulder_pitch_link.STL', 'right_shoulder_roll_link.STL', 'right_shoulder_yaw_link.STL',
+  'right_elbow_link.STL', 'right_wrist_roll_link.STL', 'right_wrist_pitch_link.STL',
+  'right_wrist_yaw_link.STL', 'right_rubber_hand.STL',
+];
+
+export type EngineMode = 'policy' | 'open-loop';
+/** Reference source: motion clips vs Gen locomotion (deploy clips | gen). */
+export type RefSource = 'clips' | 'gen';
+/** Orbit (default) vs third-person chase behind the robot. */
+export type CameraMode = 'orbit' | 'chase';
+
+/** Held teleop axes in [-1, 1]; Shift≈RT sprint, Space≈RB crouch. */
+export type GenPosture = 'loco' | 'sit';
+
+export interface GenTeleopInput {
+  forward: number;
+  strafe: number;
+  yaw: number;
+  sprint: boolean;
+  crouch: boolean;
+  /** Sticky sit posture; overrides crouch/sprint style when not loco. */
+  posture?: GenPosture;
+}
+
+export interface LiveStatus {
+  ready: boolean;
+  error: string | null;
+  loadMs: number | null;
+  obsDim: number | null;
+  modelObsDim: number | null;
+  actionDim: number | null;
+  decimation: number | null;
+  controlHz: number | null;
+  fps: number | null;
+  realtime: number | null;
+  speed: number;
+  mode: EngineMode;
+  refSource: RefSource;
+  cameraMode: CameraMode;
+  genAvailable: boolean;
+  genVx: number | null;
+  genVy: number | null;
+  genWz: number | null;
+  genHeight: number | null;
+  clipId: string | null;
+  clipName: string | null;
+  clipFrame: number | null;
+  clipFrames: number | null;
+  pelvisHeight: number | null;
+  upright: number | null;
+  fell: boolean;
+  playing: boolean;
+  inferMs: number | null;
+  loop: boolean;
+  robotIsUp: boolean;
+  fsmLabel: string;
+  canGetup: boolean;
+  canLiedown: boolean;
+  canBrowse: boolean;
+  canEnterGen: boolean;
+  clipKind: ClipKind;
+}
+
+export interface LiveEngineOptions {
+  /** Policy folder URL (Vite-base prefixed), e.g. `/wbc-demo/policies/g1-samples/`. */
+  policyBaseUrl: string;
+  /** Robot MJCF asset dir, e.g. `/wbc-demo/robots/g1/mjcf/`. */
+  mjcfBaseUrl: string;
+  startClipId?: string;
+  /** Begin playing immediately once loaded (default true). */
+  autoplay?: boolean;
+  /**
+   * If Gen assets load, enter Generator mode after boot (default true).
+   * Set false to start in clip playback; user can still press G.
+   */
+  startInGen?: boolean;
+  /** Pan the camera to follow the base as it locomotes (default true). */
+  follow?: boolean;
+  /** Cheaper viewport for many simultaneous instances (gallery cards). */
+  lowQuality?: boolean;
+  /** Enable click-drag-to-perturb on the robot (per-policy page). */
+  interactiveDrag?: boolean;
+  /**
+   * Gen params folder URL (trailing slash), e.g.
+   * `/wbc-demo/policies/g1-samples/gen/params/`. When omitted, tries
+   * `{policyBaseUrl}gen/params/`. Missing Gen assets disable Gen mode.
+   */
+  genParamsBaseUrl?: string;
+  /** Called ~once/second with a fresh status snapshot. */
+  onStatus?: (s: Readonly<LiveStatus>) => void;
+  /** Called once the clip list is known (for building a picker). */
+  onReady?: (clips: ReferenceClip[]) => void;
+  /** Called whenever the active clip changes. */
+  onClip?: (clip: ReferenceClip) => void;
+  /** Called on a fatal load error. */
+  onError?: (msg: string) => void;
+  /** Status message sink (loading progress + clip names). */
+  onMessage?: (msg: string) => void;
+  /** Called when FSM gating changes (enable/disable pose buttons). */
+  onFsm?: (s: Readonly<LiveStatus>) => void;
+}
+
+export interface LiveEngineHandle {
+  readonly viewer: Viewer;
+  readonly clips: ReferenceClip[];
+  readonly status: Readonly<LiveStatus>;
+  /** Closed-loop controller (obs / lastAction / PD) — exposed for diagnostics. */
+  readonly controller: WbcController;
+  play(): void;
+  pause(): void;
+  /** Flip play/pause; returns the new playing state. */
+  toggle(): boolean;
+  reset(): void;
+  selectClip(id: string): Promise<void>;
+  /** Play the browsable clip highlighted in select mode (deploy: A). */
+  playSelectedClip(): Promise<void>;
+  browseNextClip(): Promise<void>;
+  browsePrevClip(): Promise<void>;
+  triggerGetup(): Promise<void>;
+  triggerLiedown(): Promise<void>;
+  /** Playback/sim-time multiplier (clamped 0.1–4). */
+  setSpeed(x: number): void;
+  setMode(m: EngineMode): void;
+  /** Enter Gen locomotion (Standing only). Returns false if unavailable / down. */
+  enterGen(): Promise<boolean>;
+  /** Leave Gen → clip select (default idle hold). */
+  exitGen(): Promise<void>;
+  /** Toggle clips ↔ gen. */
+  toggleGen(): Promise<boolean>;
+  /** Update held Gen teleop axes (W/S, Q/E strafe, A/D yaw, Shift=sprint, Space=crouch). */
+  setGenTeleop(input: Partial<GenTeleopInput>): void;
+  /** D-pad / Arrow: +1 = sit, -1 = loco. */
+  nudgeGenPosture(delta: 1 | -1): void;
+  /** Seed Gen height to stand / sprint / crouch target (usually driven by teleop). */
+  setGenGaitHeight(kind: 'stand' | 'sprint' | 'crouch'): void;
+  /** Shove the base with a horizontal impulse (m/s); random direction. */
+  perturb(magnitude?: number): void;
+  /** Re-frame the camera on the robot. */
+  reframe(): void;
+  setFollow(on: boolean): void;
+  /** Third-person chase behind the robot (Key V). */
+  setChase(on: boolean): void;
+  /** Toggle chase ↔ orbit. Returns whether chase is now on. */
+  toggleChase(): boolean;
+  /** Loop the current browsable clip when it reaches the end. */
+  setLoop(on: boolean): void;
+  /** Move the viewport canvas into a new container (engine-pool reuse). */
+  reparent(container: HTMLElement): void;
+  dispose(): void;
+}
+
+export async function createLiveEngine(
+  container: HTMLElement,
+  opts: LiveEngineOptions,
+): Promise<LiveEngineHandle> {
+  const status: LiveStatus = {
+    ready: false, error: null, loadMs: null,
+    obsDim: null, modelObsDim: null, actionDim: null, decimation: null,
+    controlHz: null, fps: null, realtime: null, speed: 1, mode: 'policy',
+    refSource: 'clips', cameraMode: 'orbit', genAvailable: false,
+    genVx: null, genVy: null, genWz: null, genHeight: null,
+    clipId: null, clipName: null, clipFrame: null, clipFrames: null,
+    pelvisHeight: null, upright: null, fell: false,
+    playing: opts.autoplay !== false, inferMs: null, loop: false,
+    robotIsUp: true, fsmLabel: 'select', canGetup: false, canLiedown: false,
+    canBrowse: true, canEnterGen: false, clipKind: 'browsable',
+  };
+  const msg = (s: string) => opts.onMessage?.(s);
+  const t0 = performance.now();
+
+  msg('Loading config + reference index…');
+  let cfg: PolicyConfig;
+  let refIndex: ReferenceIndex;
+  let clipManifest: ClipManifest | null = null;
+  try {
+    [cfg, refIndex] = await Promise.all([
+      loadPolicyConfig(`${opts.policyBaseUrl}config.yaml`),
+      loadReferenceIndex(`${opts.policyBaseUrl}reference/index.json`),
+    ]);
+    try {
+      clipManifest = await loadClipManifest(`${opts.policyBaseUrl}reference/manifest.yaml`);
+    } catch {
+      msg('No reference/manifest.yaml — showing all non-pose clips');
+    }
+  } catch (err) {
+    const m = `config/index load failed: ${String(err)}`;
+    status.error = m; opts.onError?.(m); throw new Error(m);
+  }
+  status.obsDim = cfg.obsDim;
+
+  msg('Loading MuJoCo WASM + policy…');
+  let sim: MujocoSim;
+  let policy: PolicyRunner;
+  try {
+    [sim, policy] = await Promise.all([
+      loadG1Sim({
+        baseUrl: opts.mjcfBaseUrl,
+        sceneXml: SCENE_XML,
+        meshFiles: MESH_FILES,
+        onProgress: (n, total) => msg(`Fetching meshes ${n}/${total}…`),
+      }),
+      loadPolicy({
+        url: `${opts.policyBaseUrl}policy.onnx`,
+        expectedObsDim: cfg.obsDim,
+        expectedActionDim: cfg.jointNames.length,
+      }),
+    ]);
+  } catch (err) {
+    const m = `engine load failed: ${String(err)}`;
+    status.error = m; opts.onError?.(m); throw new Error(m);
+  }
+  status.decimation = Math.max(1, Math.round(cfg.policyStepDt / sim.timestep));
+  status.modelObsDim = policy.obsDim;
+  status.actionDim = policy.actionDim;
+  status.loadMs = Math.round(performance.now() - t0);
+  if (cfg.obsDim !== policy.obsDim) {
+    const m = `obs dim mismatch: assembled ${cfg.obsDim} vs model ${policy.obsDim}`;
+    status.error = m; opts.onError?.(m); throw new Error(m);
+  }
+
+  // Optional Gen locomotion reference (separate generator.onnx). Only attempted
+  // when the caller explicitly passes genParamsBaseUrl — this product ships the
+  // single WBC tracker only (WASD/Gen requires a second network).
+  let gen: GenReferenceEngine | null = null;
+  let genProprio: GenProprioReader | null = null;
+  if (opts.genParamsBaseUrl) {
+    try {
+      msg('Loading generator ONNX…');
+      gen = await createGenReferenceEngine(opts.genParamsBaseUrl);
+      status.genAvailable = true;
+      msg(`Generator ready (${gen.params.inputDim}→${gen.params.outputDim})`);
+    } catch (err) {
+      status.genAvailable = false;
+      msg(`Generator unavailable: ${String(err)}`);
+    }
+  } else {
+    status.genAvailable = false;
+  }
+
+  await whenElementSized(container);
+  let allowAutoFrame = false;
+  const viewer = new Viewer(container, {
+    lowQuality: opts.lowQuality || preferLowQualityGl(),
+    onResize: () => {
+      if (allowAutoFrame) maybeReframeOnResize();
+    },
+  });
+  const ph = viewer.robotRoot.getObjectByName('placeholder-robot');
+  if (ph) viewer.robotRoot.remove(ph);
+  const robot: GeomBinding = buildGeomRenderer({
+    sim, parent: viewer.robotRoot, includeGroups: new Set([1, 2]),
+  });
+  const controller: WbcController = makeWbcController({ sim, cfg, policy });
+  if (gen) {
+    genProprio = makeGenProprioReader(sim, gen.params, controller.baseBodyId);
+  }
+
+  // ---- interactive drag-to-perturb (GEAR-SONIC style) ----------------------
+  // Click-drag a body to apply a spring force toward the cursor, written to
+  // MuJoCo's `data.xfrc_applied` (per-body, world frame). Grabbing the robot
+  // suppresses orbit (capture-phase + stopPropagation beats OrbitControls);
+  // dragging empty space orbits as usual.
+  const raycaster = new Raycaster();
+  const ndc = new Vector2();
+  const targetThree = new Vector3(); // drag target, three.js world
+  const bodyThree = new Vector3();
+  let grabBody = -1;
+  let grabDist = 0;
+  let dragLine: Line | null = null;
+  let detachDrag: (() => void) | null = null;
+
+  function rayTargetThree(e: PointerEvent): void {
+    const rect = viewer.renderer.domElement.getBoundingClientRect();
+    ndc.set(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    raycaster.setFromCamera(ndc, viewer.camera);
+    targetThree.copy(raycaster.ray.origin).addScaledVector(raycaster.ray.direction, grabDist);
+  }
+
+  function setupDrag(): void {
+    const el = viewer.renderer.domElement;
+    const geom = new BufferGeometry().setFromPoints([new Vector3(), new Vector3()]);
+    const mat = new LineBasicMaterial({ color: 0x36cfe0, depthTest: false, transparent: true });
+    dragLine = new Line(geom, mat);
+    dragLine.visible = false;
+    dragLine.frustumCulled = false;
+    dragLine.renderOrder = 999;
+    viewer.scene.add(dragLine);
+
+    const onDown = (e: PointerEvent): void => {
+      if (e.button !== 0) return;
+      robot.root.updateWorldMatrix(true, true);
+      const rect = el.getBoundingClientRect();
+      ndc.set(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, viewer.camera);
+      const hit = raycaster.intersectObjects(robot.pickMeshes, false)[0];
+      const bid = hit?.object.userData.bodyId as number | undefined;
+      if (hit && bid != null && bid >= 1) {
+        grabBody = bid;
+        grabDist = hit.distance;
+        targetThree.copy(hit.point);
+        viewer.controls.enabled = false;
+        if (dragLine) dragLine.visible = true;
+        try { el.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+        e.stopPropagation(); // capture phase → beats OrbitControls' pointerdown
+      }
+    };
+    const onMove = (e: PointerEvent): void => {
+      if (grabBody >= 0) rayTargetThree(e);
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (grabBody < 0) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const xfrc: any = sim.data.xfrc_applied;
+      for (let i = 0; i < 6; i++) xfrc[grabBody * 6 + i] = 0;
+      grabBody = -1;
+      viewer.controls.enabled = true;
+      if (dragLine) dragLine.visible = false;
+      try { el.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    };
+
+    el.addEventListener('pointerdown', onDown, true);
+    el.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    detachDrag = () => {
+      el.removeEventListener('pointerdown', onDown, true);
+      el.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (dragLine) {
+        viewer.scene.remove(dragLine);
+        dragLine.geometry.dispose();
+        (dragLine.material as LineBasicMaterial).dispose();
+      }
+    };
+  }
+
+  /** Each frame: spring the grabbed body toward the cursor via xfrc_applied. */
+  function applyDrag(): void {
+    if (grabBody < 0) return;
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const xpos: any = sim.data.xpos;
+    const xfrc: any = sim.data.xfrc_applied;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const bx = xpos[grabBody * 3] as number;
+    const by = xpos[grabBody * 3 + 1] as number;
+    const bz = xpos[grabBody * 3 + 2] as number;
+    // Drag target three (X,Y,Z) → MuJoCo Z-up (X, -Z, Y).
+    const tx = targetThree.x;
+    const ty = -targetThree.z;
+    const tz = targetThree.y;
+    // Body-independent spring (no mass scale — was K*mass, so torso >> hand).
+    const K = 105; // N/m
+    const maxF = 300; // N
+    let fx = K * (tx - bx);
+    let fy = K * (ty - by);
+    let fz = K * (tz - bz);
+    const m = Math.hypot(fx, fy, fz);
+    if (m > maxF) { const s = maxF / m; fx *= s; fy *= s; fz *= s; }
+    xfrc[grabBody * 6] = fx;
+    xfrc[grabBody * 6 + 1] = fy;
+    xfrc[grabBody * 6 + 2] = fz;
+    if (dragLine) {
+      bodyThree.set(bx, bz, -by); // MuJoCo → three
+      const pos = dragLine.geometry.getAttribute('position');
+      pos.setXYZ(0, bodyThree.x, bodyThree.y, bodyThree.z);
+      pos.setXYZ(1, targetThree.x, targetThree.y, targetThree.z);
+      pos.needsUpdate = true;
+    }
+  }
+
+  if (opts.interactiveDrag) setupDrag();
+
+  // ---- clip + FSM state (wbc-g1-deploy Wbc_Tracking) -----------------------
+  let stream: ReferenceStream;
+  let clipFrame = 0;
+  let fellFrames = 0;
+  let follow = opts.follow !== false;
+  let chase = false;
+  let loopClip = false;
+  let speed = 1;
+  let mode: EngineMode = 'policy';
+  let refSource: RefSource = 'clips';
+  const genTeleop: GenTeleopInput = {
+    forward: 0,
+    strafe: 0,
+    yaw: 0,
+    sprint: false,
+    crouch: false,
+    posture: 'loco',
+  };
+  let gaitCrouchWas = false;
+  let gaitSprintWas = false;
+  let genPostureWas: GenPosture = 'loco';
+  let lastGenArc: Float32Array | null = null;
+  const followTarget = new Vector3();
+  const viewCenter = new Vector3();
+  const viewSize = new Vector3();
+  const chaseCam = new Vector3();
+  const chaseLook = new Vector3();
+  const chaseFwd = new Vector3();
+  let followInit = false;
+  let lastFitAspect = 0;
+
+  const browsableClips = clipManifest
+    ? resolveBrowsableClips(refIndex, clipManifest)
+    : browsableClipsWithoutManifest(refIndex);
+  if (!browsableClips.length) {
+    const m = 'clip manifest resolved to zero browsable clips';
+    status.error = m; opts.onError?.(m); throw new Error(m);
+  }
+
+  let fsm: WbcFsmState = createWbcFsm(0);
+  let activeKind: ClipKind = 'browsable';
+
+  function syncFsmStatus(): void {
+    status.robotIsUp = fsm.robotIsUp;
+    status.fsmLabel = refSource === 'gen' ? 'gen' : fsmUiLabel(fsm);
+    status.canGetup = refSource === 'clips' && canGetup(fsm);
+    status.canLiedown = refSource === 'clips' && canLiedown(fsm);
+    status.canBrowse = refSource === 'clips' && canBrowseClips(fsm);
+    status.canEnterGen = Boolean(gen) && fsm.robotIsUp && refSource === 'clips';
+    status.clipKind = activeKind;
+    status.refSource = refSource;
+    opts.onFsm?.(status);
+  }
+
+  function cruiseFromAxis(axis: number, lo: number, hi: number): number {
+    // Deploy stick_to_cruise: asymmetric map from [-1,1] stick to [lo,hi].
+    if (axis >= 0) return axis * hi;
+    return axis * (-lo); // lo typically negative
+  }
+
+  function genStyleIndexFor(
+    posture: GenPosture,
+    crouch: boolean,
+    sprint: boolean,
+  ): number {
+    if (posture === 'sit') return 3;
+    if (crouch) return 1; // crouch
+    if (sprint) return 2; // run
+    return 0; // stand_walk
+  }
+
+  function nudgePosture(cur: GenPosture, delta: number): GenPosture {
+    if (delta > 0) return 'sit';
+    if (delta < 0) return 'loco';
+    return cur;
+  }
+
+  function genVelMult(crouch: boolean, sprint: boolean): number {
+    if (crouch) return CROUCH_VEL_MULT;
+    if (sprint) return SPRINT_VEL_MULT;
+    return WALK_VEL_MULT;
+  }
+
+  function genHeightFor(crouch: boolean, sprint: boolean): number {
+    if (crouch) return CROUCH_HEIGHT;
+    if (sprint) return SPRINT_HEIGHT;
+    return STAND_HEIGHT;
+  }
+
+  function applyGenGaitHeight(seedOnEdge: boolean): void {
+    if (!gen) return;
+    const crouch = genTeleop.crouch;
+    const sprint = genTeleop.sprint;
+    const posture = genTeleop.posture ?? 'loco';
+    const edge =
+      crouch !== gaitCrouchWas ||
+      (sprint !== gaitSprintWas && !crouch) ||
+      posture !== genPostureWas;
+
+    if (gen.hasStyle()) {
+      const styleIdx = genStyleIndexFor(posture, crouch, sprint);
+      if (seedOnEdge && (edge || styleIdx !== gen.styleIndex())) {
+        gen.setStyleAndHeight(styleIdx);
+        const name = gen.params.command.styleNames[styleIdx] ?? String(styleIdx);
+        msg(
+          `Gen style=${name} posture=${posture} (h=${gen.heightCmd().toFixed(2)} m, vel×${genVelMult(crouch, sprint).toFixed(2)})`,
+        );
+      } else {
+        gen.setStyle(styleIdx);
+        gen.setHeightCmd(gen.heightCmd());
+      }
+      gaitCrouchWas = crouch;
+      gaitSprintWas = sprint;
+      genPostureWas = posture;
+      return;
+    }
+
+    const h = genHeightFor(crouch, sprint);
+    if (seedOnEdge && edge) {
+      gen.seedHeight(h);
+      if (crouch !== gaitCrouchWas) {
+        msg(
+          `Gen crouch ${crouch ? 'ON' : 'OFF'} (h=${h.toFixed(2)} m, vel×${genVelMult(crouch, sprint).toFixed(2)})`,
+        );
+      } else if (sprint !== gaitSprintWas && !crouch) {
+        msg(
+          `Gen sprint ${sprint ? 'ON' : 'OFF'} (h=${h.toFixed(2)} m, vel×${genVelMult(false, sprint).toFixed(2)})`,
+        );
+      }
+    } else {
+      gen.setHeightCmd(h);
+    }
+    gaitCrouchWas = crouch;
+    gaitSprintWas = sprint;
+    genPostureWas = posture;
+  }
+
+  function genCmdFromTeleop(): { vx: number; vy: number; wz: number } {
+    if (!gen) return { vx: 0, vy: 0, wz: 0 };
+    applyGenGaitHeight(true);
+    const velMult = genVelMult(genTeleop.crouch, genTeleop.sprint);
+    const [pxLo, pxHi] = playRange(gen.params, 'lin_vel_x', [-1.5, 5.0]);
+    const [pyLo, pyHi] = playRange(gen.params, 'lin_vel_y', [-1.0, 1.0]);
+    const [pzLo, pzHi] = playRange(gen.params, 'ang_vel_z', [-4.0, 4.0]);
+    const vx = clamp(
+      cruiseFromAxis(genTeleop.forward, CRUISE_VX[0], CRUISE_VX[1]) * velMult,
+      pxLo,
+      pxHi,
+    );
+    const vy = clamp(
+      cruiseFromAxis(genTeleop.strafe, CRUISE_VY[0], CRUISE_VY[1]) * velMult,
+      pyLo,
+      pyHi,
+    );
+    const wz = clamp(
+      cruiseFromAxis(genTeleop.yaw, CRUISE_WZ[0], CRUISE_WZ[1]) * velMult,
+      pzLo,
+      pzHi,
+    );
+    return applyIdleDeadzone(vx, vy, wz);
+  }
+
+  async function enterGen(): Promise<boolean> {
+    if (!gen || !genProprio) {
+      msg('Generator not loaded');
+      return false;
+    }
+    if (!fsm.robotIsUp) {
+      msg('Down — getup before Gen');
+      return false;
+    }
+    if (refSource === 'gen') return true;
+    // Stop clip playback; Gen owns the Arc from here.
+    status.playing = false;
+    enterClipSelectMode(fsm);
+    gen.reset();
+    if (gen.hasStyle()) {
+      gen.setStyleAndHeight(0);
+    } else {
+      gen.seedHeight(STAND_HEIGHT);
+    }
+    gaitCrouchWas = false;
+    gaitSprintWas = false;
+    genPostureWas = 'loco';
+    genTeleop.sprint = false;
+    genTeleop.crouch = false;
+    genTeleop.posture = 'loco';
+    // Warm history like deploy (~20 proprio pushes).
+    for (let i = 0; i < 20; i++) gen.pushProprio(genProprio.sample());
+    refSource = 'gen';
+    lastGenArc = null;
+    controller.resetActions();
+    syncFsmStatus();
+    msg(
+      'Switched to Generator — W/S move, Q/E strafe, A/D turn, Shift=sprint, Space=crouch, ↓/↑ sit↔loco',
+    );
+    return true;
+  }
+
+  async function exitGen(): Promise<void> {
+    if (refSource !== 'gen') return;
+    refSource = 'clips';
+    lastGenArc = null;
+    status.genVx = null;
+    status.genVy = null;
+    status.genWz = null;
+    status.genHeight = null;
+    // Return to default idle hold (deploy mode_clips → enter_stand_hold).
+    const idle =
+      defaultBrowsableClip(browsableClips, clipManifest) ?? browsableClips[0];
+    if (idle) {
+      fsm.selectedBrowsableIndex = Math.max(0, browsableClips.indexOf(idle));
+      await loadClip(idle, 'browsable', false, false);
+    } else {
+      enterClipSelectMode(fsm);
+      syncFsmStatus();
+    }
+    msg('Switched to clips');
+  }
+
+  async function toggleGen(): Promise<boolean> {
+    if (refSource === 'gen') {
+      await exitGen();
+      return false;
+    }
+    return enterGen();
+  }
+
+  async function loadClipStream(c: ReferenceClip): Promise<void> {
+    msg(`Loading clip ${c.name}…`);
+    stream = await loadReferenceStream(
+      `${opts.policyBaseUrl}reference/${c.file}`,
+      refIndex.commandDim,
+    );
+    status.clipId = c.id;
+    status.clipName = c.name;
+    status.clipFrames = stream.frames;
+    opts.onClip?.(c);
+  }
+
+  async function loadClip(
+    c: ReferenceClip,
+    kind: ClipKind,
+    autoplay: boolean,
+    resetPose = false,
+  ): Promise<void> {
+    activeKind = kind;
+    await loadClipStream(c);
+    clipFrame = 0;
+    // Deploy applyMotionLoader: swap reference + reset policy episode, not robot qpos.
+    if (resetPose) {
+      controller.resetToReference(stream.frame(0));
+      status.fell = false;
+      fellFrames = 0;
+    } else {
+      controller.resetActions();
+    }
+    robot.sync(sim);
+    followInit = false;
+    if (autoplay) {
+      if (kind === 'browsable') startBrowsablePlayback(fsm);
+      else startPosePlayback(fsm, kind);
+      status.playing = true;
+    } else {
+      enterClipSelectMode(fsm);
+      status.playing = false;
+    }
+    syncFsmStatus();
+    msg(`Tracking “${c.name}” (${stream.frames} frames)`);
+  }
+
+  async function selectClip(id: string): Promise<void> {
+    if (refSource === 'gen') return;
+    const idx = browsableClips.findIndex((x) => x.id === id);
+    const c = idx >= 0 ? browsableClips[idx] : browsableClips[0];
+    if (!c) throw new Error('no browsable clips');
+    fsm.selectedBrowsableIndex = idx >= 0 ? idx : 0;
+    await loadClip(c, 'browsable', true, false);
+  }
+
+  async function playSelectedClip(): Promise<void> {
+    if (refSource === 'gen') return;
+    if (!canPlaySelectedClip(fsm)) return;
+    const c = browsableClips[fsm.selectedBrowsableIndex];
+    if (!c) return;
+    await loadClip(c, 'browsable', true, false);
+  }
+
+  async function browseNextClip(): Promise<void> {
+    if (refSource === 'gen') return;
+    browseNext(fsm, browsableClips.length);
+    syncFsmStatus();
+    if (!canBrowseClips(fsm)) return;
+    const c = browsableClips[fsm.selectedBrowsableIndex]!;
+    await loadClip(c, 'browsable', true, false);
+  }
+
+  async function browsePrevClip(): Promise<void> {
+    if (refSource === 'gen') return;
+    browsePrev(fsm, browsableClips.length);
+    syncFsmStatus();
+    if (!canBrowseClips(fsm)) return;
+    const c = browsableClips[fsm.selectedBrowsableIndex]!;
+    await loadClip(c, 'browsable', true, false);
+  }
+
+  async function triggerGetup(): Promise<void> {
+    if (refSource === 'gen') return;
+    if (!canGetup(fsm)) return;
+    const c = resolvePoseClip(refIndex, clipManifest, 'getup');
+    if (!c) {
+      msg('getup clip missing from reference index');
+      return;
+    }
+    await loadClip(c, 'pose_getup', true, false);
+  }
+
+  async function triggerLiedown(): Promise<void> {
+    if (refSource === 'gen') return;
+    if (!canLiedown(fsm)) return;
+    const c = resolvePoseClip(refIndex, clipManifest, 'liedown');
+    if (!c) {
+      msg('liedown clip missing from reference index');
+      return;
+    }
+    await loadClip(c, 'pose_liedown', true, false);
+  }
+
+  /** Teleport robot onto the current Arc pose; leave clip/Gen mode alone. */
+  function resetSimState(): void {
+    let ref: Float32Array;
+    if (refSource === 'gen' && gen) {
+      if (lastGenArc) {
+        ref = lastGenArc;
+      } else {
+        // Idle stand Arc from Gen defaults (before first step).
+        ref = new Float32Array(gen.params.outputDim);
+        ref[0] = STAND_HEIGHT;
+        ref[9] = -1; // projected gravity z
+        const dj = gen.params.defaultJointPos;
+        for (let j = 0; j < dj.length && 10 + j < ref.length; j++) {
+          ref[10 + j] = dj[j]!;
+        }
+      }
+      controller.resetToReference(ref);
+      robot.sync(sim);
+      gen.reset();
+      gen.seedHeight(gen.heightCmd());
+      if (genProprio) {
+        for (let i = 0; i < 20; i++) gen.pushProprio(genProprio.sample());
+      }
+    } else {
+      // Keep clip frame / FSM; only re-seed qpos/qvel from the current Arc.
+      ref = stream.frame(clipFrame);
+      controller.resetToReference(ref);
+      robot.sync(sim);
+    }
+    status.fell = false;
+    fellFrames = 0;
+    followInit = false;
+  }
+
+  function finishClipPlayback(): void {
+    if (loopClip && activeKind === 'browsable') {
+      clipFrame = 0;
+      controller.resetActions();
+      status.playing = true;
+      startBrowsablePlayback(fsm);
+      syncFsmStatus();
+      return;
+    }
+    clipFrame = Math.max(0, stream.frames - 1);
+    onClipFinished(fsm);
+    status.playing = false;
+    syncFsmStatus();
+  }
+
+  const startClip =
+    browsableClips.find((c) => c.id === opts.startClipId) ??
+    defaultBrowsableClip(browsableClips, clipManifest);
+  if (!startClip) {
+    const m = 'no default browsable clip';
+    status.error = m; opts.onError?.(m); throw new Error(m);
+  }
+  fsm.selectedBrowsableIndex = Math.max(0, browsableClips.indexOf(startClip));
+  await loadClip(startClip, 'browsable', opts.autoplay !== false, true);
+  if (opts.startInGen !== false && gen) {
+    await enterGen();
+  }
+  frameViewer();
+  allowAutoFrame = true;
+  opts.onReady?.(browsableClips);
+
+  // ---- control + render loop ----------------------------------------------
+  const policyDt = cfg.policyStepDt;
+  const decimation = status.decimation!;
+  let last = performance.now();
+  let acc = 0;
+  let ctrlCount = 0;
+  let frameCount = 0;
+  let windowStart = performance.now();
+  let inferAccum = 0;
+  let inferCount = 0;
+  let stepping = false;
+  let running = true;
+  let rafId = 0;
+
+  async function controlStep(): Promise<void> {
+    const tI = performance.now();
+    let refFrame: Float32Array;
+    if (refSource === 'gen' && gen && genProprio) {
+      gen.pushProprio(genProprio.sample());
+      const { vx, vy, wz } = genCmdFromTeleop();
+      status.genVx = +vx.toFixed(2);
+      status.genVy = +vy.toFixed(2);
+      status.genWz = +wz.toFixed(2);
+      status.genHeight = +gen.heightCmd().toFixed(2);
+      lastGenArc = await gen.step(vx, vy, wz);
+      refFrame = lastGenArc;
+      // Gen always "plays" while active.
+      status.playing = true;
+    } else {
+      refFrame = stream.frame(clipFrame);
+    }
+
+    if (mode === 'policy') {
+      await controller.step(refFrame);
+    } else {
+      controller.holdReference(refFrame);
+    }
+    inferAccum += performance.now() - tI;
+    inferCount += 1;
+    for (let s = 0; s < decimation; s++) {
+      controller.applyTorque();
+      sim.mujoco.mj_step(sim.model, sim.data);
+    }
+    ctrlCount += 1;
+    if (refSource === 'clips' && status.playing && fsm.clipPlaybackActive) {
+      if (clipFrame >= stream.frames - 1) {
+        finishClipPlayback();
+      } else {
+        clipFrame += 1;
+      }
+    }
+  }
+
+  function frame(): void {
+    if (!running) return;
+    const now = performance.now();
+    let elapsed = (now - last) / 1000;
+    last = now;
+    if (elapsed > 0.1) elapsed = 0.1;
+    acc += elapsed * speed;
+
+    applyDrag(); // set xfrc_applied before stepping so mj_step sees the drag force
+
+    if (!stepping && acc >= policyDt) {
+      stepping = true;
+      void (async () => {
+        let budget = Math.max(4, Math.ceil(4 * speed));
+        while (acc >= policyDt && budget-- > 0) {
+          await controlStep();
+          acc -= policyDt;
+        }
+        stepping = false;
+      })();
+    }
+
+    robot.sync(sim);
+    if (chase) chaseRobot();
+    else if (follow) followRobot();
+    frameCount += 1;
+
+    if (now - windowStart >= 1000) {
+      const secs = (now - windowStart) / 1000;
+      status.controlHz = Math.round(ctrlCount / secs);
+      status.fps = Math.round(frameCount / secs);
+      status.realtime = +(status.controlHz * policyDt).toFixed(2);
+      status.inferMs = inferCount ? +(inferAccum / inferCount).toFixed(2) : null;
+      status.clipFrame = clipFrame;
+      status.speed = speed;
+      status.mode = mode;
+      status.refSource = refSource;
+      status.cameraMode = chase ? 'chase' : 'orbit';
+      updateLiveSignals();
+      opts.onStatus?.(status);
+      ctrlCount = 0; frameCount = 0; inferAccum = 0; inferCount = 0;
+      windowStart = now;
+    }
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function updateLiveSignals(): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const xpos: any = sim.data.xpos;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const xquat: any = sim.data.xquat;
+    const b = controller.baseBodyId;
+    const h = xpos[b * 3 + 2] as number;
+    status.pelvisHeight = +h.toFixed(3);
+    const qw = xquat[b * 4] as number;
+    const qx = xquat[b * 4 + 1] as number;
+    const qy = xquat[b * 4 + 2] as number;
+    const qz = xquat[b * 4 + 3] as number;
+    const gz = -(qw * qw - qx * qx - qy * qy + qz * qz);
+    status.upright = +gz.toFixed(3);
+    if (h < 0.45 && fsm.robotIsUp) fellFrames += 1;
+    else fellFrames = 0;
+    status.fell = fsm.robotIsUp && fellFrames >= 1;
+  }
+
+  function robotViewRadius(): number | null {
+    robot.root.updateWorldMatrix(true, true);
+    const box = new Box3().setFromObject(robot.root);
+    if (box.isEmpty()) return null;
+    box.getCenter(viewCenter);
+    box.getSize(viewSize);
+    const r = Math.max(viewSize.x, viewSize.y, viewSize.z);
+    return r > 0.05 ? r : null;
+  }
+
+  /** Distance that fills the current viewport with the robot bbox. */
+  function fitCameraDistance(): number | null {
+    if (robotViewRadius() == null) return null;
+    const aspect = Math.max(viewer.camera.aspect, 0.2);
+    const halfH = Math.max(viewSize.y * 0.5, 0.55);
+    const halfW = Math.max(Math.max(viewSize.x, viewSize.z) * 0.5, 0.22);
+    const vFov = (viewer.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+    const distV = halfH / Math.tan(vFov / 2);
+    const distH = halfW / Math.tan(hFov / 2);
+    const pad = aspect < 0.85 ? 1.08 : aspect < 1.25 ? 1.14 : 1.18;
+    return Math.max(distV, distH) * pad * 1.1;
+  }
+
+  function followRobot(): void {
+    const radius = robotViewRadius();
+    if (radius == null) return;
+    const targetY = Math.max(viewCenter.y, 0.5);
+    followTarget.set(viewCenter.x, targetY, viewCenter.z);
+
+    if (!followInit) {
+      viewer.controls.target.copy(followTarget);
+      followInit = true;
+      return;
+    }
+
+    const alpha = 0.14;
+    const dx = (followTarget.x - viewer.controls.target.x) * alpha;
+    const dy = (followTarget.y - viewer.controls.target.y) * alpha;
+    const dz = (followTarget.z - viewer.controls.target.z) * alpha;
+    viewer.controls.target.x += dx;
+    viewer.controls.target.y += dy;
+    viewer.controls.target.z += dz;
+    viewer.camera.position.x += dx;
+    viewer.camera.position.y += dy;
+    viewer.camera.position.z += dz;
+  }
+
+  /** Rotate MuJoCo body +X by world quat (w,x,y,z) → world vector. */
+  function quatApplyFwd(
+    qw: number, qx: number, qy: number, qz: number,
+  ): [number, number, number] {
+    const vx = 1;
+    const vy = 0;
+    const vz = 0;
+    const txv = 2 * (qy * vz - qz * vy);
+    const tyv = 2 * (qz * vx - qx * vz);
+    const tzv = 2 * (qx * vy - qy * vx);
+    return [
+      vx + qw * txv + (qy * tzv - qz * tyv),
+      vy + qw * tyv + (qz * txv - qx * tzv),
+      vz + qw * tzv + (qx * tyv - qy * txv),
+    ];
+  }
+
+  /**
+   * Chase cam: camera behind pelvis yaw, looking at mid-body (feet in frame).
+   * MuJoCo Z-up (x,y,z) → Three Y-up (x, z, -y).
+   */
+  function chaseRobot(): void {
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const xpos: any = sim.data.xpos;
+    const xquat: any = sim.data.xquat;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const b = controller.baseBodyId;
+    const px = xpos[b * 3] as number;
+    const py = xpos[b * 3 + 1] as number;
+    const pz = xpos[b * 3 + 2] as number;
+    const qw = xquat[b * 4] as number;
+    const qx = xquat[b * 4 + 1] as number;
+    const qy = xquat[b * 4 + 2] as number;
+    const qz = xquat[b * 4 + 3] as number;
+
+    let [fx, fy] = quatApplyFwd(qw, qx, qy, qz);
+    // Flatten to horizontal (ignore pitch/roll wobble).
+    const flen = Math.hypot(fx, fy);
+    if (flen < 1e-4) {
+      fx = 1;
+      fy = 0;
+    } else {
+      fx /= flen;
+      fy /= flen;
+    }
+    // MuJoCo forward (fx, fy, 0) → Three (fx, 0, -fy)
+    chaseFwd.set(fx, 0, -fy);
+
+    // Aim a bit above mid-body so the robot sits slightly lower in the frame.
+    const lookY = Math.max(pz * 0.42, 0.5) + 0.18;
+    chaseLook.set(px, lookY, -py);
+
+    const dist = fitCameraDistance() ?? 1.8;
+    const back = Math.max(1.15, dist * 0.72);
+    const up = Math.max(0.42, dist * 0.26);
+    chaseCam.copy(chaseLook).addScaledVector(chaseFwd, -back);
+    chaseCam.y += up;
+
+    const alpha = 0.18;
+    viewer.camera.position.lerp(chaseCam, alpha);
+    viewer.controls.target.lerp(chaseLook, alpha);
+    viewer.camera.lookAt(viewer.controls.target);
+  }
+
+  function setChase(on: boolean): void {
+    chase = on;
+    status.cameraMode = on ? 'chase' : 'orbit';
+    viewer.controls.enabled = !on;
+    if (on) {
+      // Snap once so the first frame isn't a long lerp from orbit.
+      chaseRobot();
+      viewer.camera.position.copy(chaseCam);
+      viewer.controls.target.copy(chaseLook);
+      viewer.camera.lookAt(viewer.controls.target);
+      msg('Camera: chase — V to orbit');
+    } else {
+      followInit = false;
+      viewer.controls.update();
+      msg('Camera: orbit — V for chase');
+    }
+  }
+
+  function toggleChase(): boolean {
+    setChase(!chase);
+    return chase;
+  }
+
+  function frameViewer(): void {
+    const dist = fitCameraDistance();
+    if (dist == null) return;
+    const targetY = Math.max(viewCenter.y, 0.5);
+    viewer.controls.target.set(viewCenter.x, targetY, viewCenter.z);
+    // 3/4 orbit, elevation ~18° — distance from FOV so the robot fills the frame.
+    const az = Math.atan2(1.9, 1.3);
+    const el = 18 * (Math.PI / 180);
+    const horiz = dist * Math.cos(el);
+    viewer.camera.position.set(
+      viewCenter.x + horiz * Math.cos(az),
+      targetY + dist * Math.sin(el),
+      viewCenter.z + horiz * Math.sin(az),
+    );
+    viewer.camera.near = dist / 80;
+    viewer.camera.far = dist * 80;
+    viewer.camera.updateProjectionMatrix();
+    viewer.camera.lookAt(viewer.controls.target);
+    followInit = true;
+    lastFitAspect = viewer.camera.aspect;
+  }
+
+  function maybeReframeOnResize(): void {
+    const a = viewer.camera.aspect;
+    if (lastFitAspect > 0 && Math.abs(a - lastFitAspect) < 0.03) return;
+    lastFitAspect = a;
+    if (chase) {
+      chaseRobot();
+      viewer.camera.position.copy(chaseCam);
+      viewer.controls.target.copy(chaseLook);
+      viewer.camera.lookAt(viewer.controls.target);
+    } else {
+      frameViewer();
+    }
+  }
+
+  status.ready = true;
+  rafId = requestAnimationFrame(frame);
+
+  return {
+    viewer,
+    clips: browsableClips,
+    status,
+    controller,
+    play() {
+      if (canPlaySelectedClip(fsm)) {
+        void playSelectedClip();
+        return;
+      }
+      if (fsm.clipPlaybackActive) status.playing = true;
+    },
+    pause() { status.playing = false; },
+    toggle() {
+      if (canPlaySelectedClip(fsm) && !status.playing) {
+        void playSelectedClip();
+        return true;
+      }
+      status.playing = !status.playing;
+      return status.playing;
+    },
+    reset() { resetSimState(); },
+    selectClip,
+    playSelectedClip,
+    browseNextClip,
+    browsePrevClip,
+    triggerGetup,
+    triggerLiedown,
+    setSpeed(x: number) { speed = Math.min(4, Math.max(0.1, x)); status.speed = speed; },
+    setMode(m: EngineMode) {
+      mode = m; status.mode = m;
+      if (m === 'open-loop') controller.resetActions();
+    },
+    enterGen,
+    exitGen,
+    toggleGen,
+    setGenTeleop(input: Partial<GenTeleopInput>) {
+      if (input.forward != null) genTeleop.forward = clamp(input.forward, -1, 1);
+      if (input.strafe != null) genTeleop.strafe = clamp(input.strafe, -1, 1);
+      if (input.yaw != null) genTeleop.yaw = clamp(input.yaw, -1, 1);
+      if (input.sprint != null) genTeleop.sprint = Boolean(input.sprint);
+      if (input.crouch != null) genTeleop.crouch = Boolean(input.crouch);
+      if (input.posture != null) genTeleop.posture = input.posture;
+    },
+    nudgeGenPosture(delta: 1 | -1) {
+      if (refSource !== 'gen' || !gen?.hasStyle()) return;
+      genTeleop.posture = nudgePosture(genTeleop.posture ?? 'loco', delta);
+      applyGenGaitHeight(true);
+      status.genHeight = +gen.heightCmd().toFixed(2);
+    },
+    setGenGaitHeight(kind: 'stand' | 'sprint' | 'crouch') {
+      if (refSource !== 'gen' || !gen) return;
+      if (gen.hasStyle()) {
+        genTeleop.posture = 'loco';
+        const styleIdx = kind === 'crouch' ? 1 : kind === 'sprint' ? 2 : 0;
+        gen.setStyleAndHeight(styleIdx);
+      } else {
+        const h =
+          kind === 'crouch' ? CROUCH_HEIGHT : kind === 'sprint' ? SPRINT_HEIGHT : STAND_HEIGHT;
+        gen.seedHeight(h);
+      }
+      status.genHeight = +gen.heightCmd().toFixed(2);
+    },
+    perturb(magnitude = 3.0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const qvel: any = sim.data.qvel;
+      const theta = (clipFrame % 360) * (Math.PI / 180); // deterministic-ish direction
+      qvel[0] = (qvel[0] as number) + Math.cos(theta) * magnitude;
+      qvel[1] = (qvel[1] as number) + Math.sin(theta) * magnitude;
+    },
+    reframe() { frameViewer(); },
+    setFollow(on: boolean) {
+      if (chase && on) setChase(false);
+      follow = on;
+      followInit = false;
+    },
+    setChase,
+    toggleChase,
+    setLoop(on: boolean) {
+      loopClip = on;
+      status.loop = on;
+    },
+    reparent(el: HTMLElement) { viewer.reparent(el); },
+    dispose() {
+      running = false;
+      cancelAnimationFrame(rafId);
+      detachDrag?.();
+      void gen?.dispose();
+      viewer.dispose();
+    },
+  };
+}

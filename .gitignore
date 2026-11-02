@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Local toolchain (optional Node binary for Vite 8)
+.tools/
+
+# Local screenshots / scratch
+tmp/
+
+# Build output
+dist/
+
+# Vite cache
+.vite/
+
+# OS / editor
+.DS_Store
+*.log

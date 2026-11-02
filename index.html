@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0D0F11" />
+    <title>V.K. Nguyen · Physics, Philosophy & Tech</title>
+    <meta
+      name="description"
+      content="V.K. Nguyen — Physics & Philosophy at Reed College. A tech-loving student who builds interactive experiments, including a live Unitree G1 lab in the browser."
+    />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/style.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css"
+    />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('wbc-demo-theme');
+          document.documentElement.dataset.theme =
+            t === 'light' || t === 'dark' ? t : 'dark';
+          document.documentElement.style.colorScheme =
+            document.documentElement.dataset.theme;
+        } catch (e) {
+          document.documentElement.dataset.theme = 'dark';
+          document.documentElement.style.colorScheme = 'dark';
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/home/home.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+---
+description: Precision in Motion — personal site + G1 lab visual language
+globs: src/styles/**/*.{css},src/home/**/*.{ts,css},src/live-demo.ts,index.html,lab.html
+alwaysApply: false
+---
+
+# Design system — Precision in Motion
+
+## Product surfaces
+
+1. **Homepage (`/`)** — personal introduction; G1 is a product reveal, not a dashboard.
+2. **Lab (`/lab.html`)** — instrument panel for closed-loop simulation.
+
+The Unitree G1 is the hero on both. Chrome stays quiet.
+
+## Principles
+
+- **Precision over decoration.** No purple gradients, neon glows, glass stacks, emoji, or SaaS card grids.
+- **Product over dashboard.** Homepage: storytelling + one immersive viewport. Lab: viewport ≈ 75–85%.
+- **Restraint over effects.** Motion ≤ 180ms (UI), band reveals ~480ms. Honor `prefers-reduced-motion`.
+- **Honesty.** Only claim motions/projects verified in content sources. No fake animations or invented publications.
+- Lazy-load MuJoCo/ONNX on the homepage; keep bio readable without WebGL.
+
+## Tokens (`src/styles/tokens.css`)
+
+Obsidian studio + champagne tech accent (no purple neon).
+
+| Token | Role |
+|-------|------|
+| `--bg` `#08090B` | Page |
+| `--surface` `#101214` | Rails / nav / bands |
+| `--surface-raised` `#181B1F` | Controls |
+| `--text` `#F3F0EA` | Warm platinum |
+| `--muted` `#9A958C` | Secondary |
+| `--accent` `#C6B089` | Champagne CTAs / selection |
+| `--accent-strong` `#E2D2B0` | Hover / emphasis |
+| `--border` `#2A2D31` | Hairlines |
+| `--radius` `6px` | Controls |
+
+Typography: **Geist Sans** (UI) + **Geist Mono** (telemetry, kickers, years).
+
+## Content source of truth
+
+Personal copy lives in `src/home/content.ts` (V.K. Nguyen résumé). Narrative: physics + philosophy + tech. Do not invent jobs, papers, or contact details. No “AI” marketing marks in the UI.
+
+## Do not change for UI work
+
+MuJoCo, ONNX, controllers, observation order, PD gains, policy weights, or simulation timing.
